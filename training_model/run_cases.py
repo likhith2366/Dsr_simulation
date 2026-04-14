@@ -23,13 +23,14 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_STEPS = 50
 
 
-def run_case(case_name: str):
+def run_case(case_name: str, known_faults: bool = False):
+    mode = 'KNOWN faults' if known_faults else 'UNKNOWN faults'
     print(f"\n{'='*60}")
-    print(f"  Case: {case_name}")
+    print(f"  Case: {case_name}  [{mode}]")
     print(f"{'='*60}")
 
     env = DSREnvironment()
-    env.setup(case_name, num_scouts=1)
+    env.setup(case_name, num_scouts=1, known_faults=known_faults)
 
     # Print initial state
     state = env.get_state()
@@ -41,6 +42,8 @@ def run_case(case_name: str):
         print(f"    {rc.id} @ {rc.position}")
     for s in env.scouts.values():
         print(f"    {s.id} @ {s.position}")
+    for m in env.mps.values():
+        print(f"    {m.id} @ {m.position} (energy={m.energy:.0f}kWh)")
 
     # Save initial graph
     draw_network(env,
@@ -49,19 +52,18 @@ def run_case(case_name: str):
                  show=False)
 
     # Simulation loop
-    for step in range(MAX_STEPS):
+    for _ in range(MAX_STEPS):
         result = env.step()
 
         # Print events
         for event in result['events']:
             print(f"  [t={result['time']:02d}] {event}")
 
-        # Every 10 steps save a graph
-        if result['time'] % 10 == 0:
-            draw_network(env,
-                         title=f'{case_name} — Step {result["time"]}',
-                         save_path=os.path.join(OUTPUT_DIR, f'{case_name}_step{result["time"]}.png'),
-                         show=False)
+        # Save graph every step
+        draw_network(env,
+                     title=f'{case_name} — Step {result["time"]}',
+                     save_path=os.path.join(OUTPUT_DIR, f'{case_name}_step{result["time"]:02d}.png'),
+                     show=False)
 
         if result['done']:
             print(f"\n  All faults repaired at step {result['time']}!")
@@ -74,34 +76,69 @@ def run_case(case_name: str):
                  show=False)
 
     # Summary
+    max_reward = sum(l.W * l.P for l in env.loads.values())
     print(f"\n  Summary:")
-    print(f"    Steps taken : {env.time}")
-    print(f"    Final reward: {env.get_reward():.0f} / {sum(l.W*l.P for l in env.loads.values()):.0f}")
-    print(f"    Loads ON    : {sum(1 for l in env.loads.values() if l.state=='on')}/{len(env.loads)}")
+    print(f"    Total time   : {env.time} hours")
+    print(f"    Final reward : {env.get_reward():.0f} / {max_reward:.0f} W*P")
+    print(f"    Loads ON     : {sum(1 for l in env.loads.values() if l.state=='on')}/{len(env.loads)}")
+
+    print(f"\n  Fault Timeline:")
     for dp in env.faults.values():
-        disc = f"by {dp.discovered_by}" if dp.discovered else "NOT FOUND"
-        print(f"    {dp.id}: {dp.state} (discovered {disc})")
+        disc_t   = f"t={dp.discovered_at_step}h" if dp.discovered_at_step is not None else "NOT FOUND"
+        repair_t = f"t={dp.repaired_at_step}h"   if dp.repaired_at_step   is not None else "NOT REPAIRED"
+        lag      = ((dp.repaired_at_step or 0) - (dp.discovered_at_step or 0)) if dp.discovered_at_step else '-'
+        print(f"    {dp.id:4s}: discovered={disc_t:8s}  repaired={repair_t:8s}  "
+              f"repair_lag={lag}h  by={dp.discovered_by or 'none'}")
+
+    print(f"\n  Agent Stats:")
+    for rc in env.rcs.values():
+        s = rc.stats
+        print(f"    {rc.id}: {s['total_km']:.1f}km traveled | "
+              f"{s['hours_moving']}h moving | "
+              f"{s['hours_repairing']}h repairing | "
+              f"{s['hours_idle']}h idle | "
+              f"repaired={s['faults_repaired']}")
+
+    for scout in env.scouts.values():
+        s = scout.stats
+        print(f"    {scout.id}: {s['total_km']:.1f}km traveled | "
+              f"{s['hours_moving']}h moving | "
+              f"{s['hours_idle']}h idle | "
+              f"{s['nodes_visited']} nodes visited | "
+              f"found={len(s['discovery_log'])} faults")
+
+    for mps in env.mps.values():
+        s = mps.stats
+        print(f"    {mps.id}: {s['total_km']:.1f}km traveled | "
+              f"{s['hours_moving']}h moving | "
+              f"{s['hours_connected']}h connected | "
+              f"{s['hours_idle']}h idle | "
+              f"energy left={mps.energy:.0f}kWh")
 
     return {
-        'case': case_name,
-        'steps': env.time,
+        'case':   case_name,
+        'steps':  env.time,
         'reward': env.get_reward(),
-        'done': env.is_done()
+        'done':   env.is_done(),
+        'mode':   'known' if known_faults else 'unknown'
     }
 
 
 if __name__ == '__main__':
-    results = []
+    known_results   = []
+    unknown_results = []
+
     for case in IEEE13Cases.all_cases():
-        r = run_case(case)
-        results.append(r)
+        known_results.append(run_case(case, known_faults=True))
+        unknown_results.append(run_case(case, known_faults=False))
 
     print(f"\n{'='*60}")
-    print("  All Cases Summary")
+    print("  Comparison: Known vs Unknown Faults")
     print(f"{'='*60}")
-    print(f"  {'Case':<10} {'Steps':>6} {'Reward':>10} {'Done':>6}")
-    print(f"  {'-'*36}")
-    for r in results:
-        print(f"  {r['case']:<10} {r['steps']:>6} {r['reward']:>10.0f} {str(r['done']):>6}")
+    print(f"  {'Case':<10} {'Known Steps':>12} {'Unknown Steps':>14} {'Extra Hours':>12}")
+    print(f"  {'-'*52}")
+    for k, u in zip(known_results, unknown_results):
+        extra = u['steps'] - k['steps']
+        print(f"  {k['case']:<10} {k['steps']:>12} {u['steps']:>14} {extra:>+12}")
 
     print(f"\n  Graph images saved to: {OUTPUT_DIR}/")

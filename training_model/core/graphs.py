@@ -102,18 +102,19 @@ class EGraph:
         if edge_id in self.edges:
             self.edges[edge_id]['state'] = state
 
-    def get_powered_nodes(self) -> Set[str]:
+    def get_powered_nodes(self, mps_sources: List[str] = None) -> Set[str]:
         """
-        BFS from GRID node through live edges.
-        Returns all nodes reachable from grid (have power).
+        BFS from GRID + any connected MPS nodes through live edges.
+        Returns all nodes reachable from a power source (have power).
         """
         grid_nodes = [n for n, t in self.nodes.items() if t == 'GRID']
-        if not grid_nodes:
+        sources = grid_nodes + (list(mps_sources) if mps_sources else [])
+        if not sources:
             return set()
 
         powered = set()
-        queue = list(grid_nodes)
-        powered.update(grid_nodes)
+        queue = list(sources)
+        powered.update(sources)
 
         while queue:
             node = queue.pop(0)
@@ -124,6 +125,20 @@ class EGraph:
                     queue.append(neighbor)
 
         return powered
+
+    def count_loads_if_source(self, node: str) -> int:
+        """How many LOAD nodes would be powered if node were an extra source?"""
+        powered = set()
+        queue = [node]
+        powered.add(node)
+        while queue:
+            n = queue.pop(0)
+            for neighbor, edge_id in self.adjacency.get(n, []):
+                edge = self.edges[edge_id]
+                if edge['state'] == 'closed' and neighbor not in powered:
+                    powered.add(neighbor)
+                    queue.append(neighbor)
+        return sum(1 for n in powered if self.nodes.get(n) == 'LOAD')
 
     def apply_fault(self, fault: dict):
         """Mark edges as faulted based on fault config."""

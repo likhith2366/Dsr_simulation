@@ -130,10 +130,44 @@ class IEEE13Network:
 
 
 class IEEE13Cases:
-    """5 training cases for unknown fault discovery."""
+    """
+    5 training cases for unknown fault discovery.
+
+    Fault rules:
+      - Node faults only at BUS or LOAD nodes (never at switches S1/S2)
+      - Edge faults on any power line
+      - outage_zones = nodes the operator observes as dark (SCADA / customer calls)
+        Fault locations within the zone are unknown — agents must search there.
+    """
 
     CASES = {
+        # ── Case 1 ─────────────────────────────────────────────
+        # Story: Three isolated line faults each cutting one load.
+        # Small, scattered outage. Good warm-up case.
+        # Powered after faults: Grid N1 N2 N4 N6 N8 N3 N10 N12 N13 V1 V2 V3 S1 S2
         'Case1': {
+            'repair_crews': {
+                'RC1': {'position': 'N2', 'speed': 4, 'efficiency': 3, 'resources': 10},
+                'RC2': {'position': 'N8', 'speed': 5, 'efficiency': 3, 'resources': 10},
+            },
+            'mobile_power': {
+                'MPS1': {'position': 'N4',  'speed': 8, 'p_limit': 600, 'energy': 3000},
+                'MPS2': {'position': 'N10', 'speed': 8, 'p_limit': 600, 'energy': 3000},
+            },
+            'faults': [
+                {'id': 'DP1', 'type': 'edge', 'edge': ('N4',  'N5'),  'demand': 6, 'cap': 1},
+                {'id': 'DP2', 'type': 'edge', 'edge': ('N8',  'N9'),  'demand': 5, 'cap': 1},
+                {'id': 'DP3', 'type': 'edge', 'edge': ('N10', 'N11'), 'demand': 4, 'cap': 1},
+            ],
+            'outage_zones': ['N5', 'N9', 'N11'],
+        },
+
+        # ── Case 2 ─────────────────────────────────────────────
+        # Story: Main feeder to N3-section is cut (large dark zone) + two small
+        # branch faults on separate legs. Agents must cover the big section
+        # and the two isolated branches.
+        # Powered after faults: Grid N1 N2 N4 N6 V2 V3
+        'Case2': {
             'repair_crews': {
                 'RC1': {'position': 'N9',  'speed': 3, 'efficiency': 2, 'resources': 12},
                 'RC2': {'position': 'N2',  'speed': 5, 'efficiency': 3, 'resources': 12},
@@ -143,49 +177,42 @@ class IEEE13Cases:
                 'MPS2': {'position': 'V3',  'speed': 8, 'p_limit': 750, 'energy': 4000},
             },
             'faults': [
-                {'id': 'DP1', 'type': 'node', 'node': 'N5',  'demand': 10, 'cap': 2},
-                {'id': 'DP2', 'type': 'node', 'node': 'S2',  'demand': 4,  'cap': 1},
-                {'id': 'DP3', 'type': 'edge', 'edge': ('N2', 'S1'), 'demand': 10, 'cap': 2},
+                {'id': 'DP1', 'type': 'edge', 'edge': ('N2', 'S1'),  'demand': 8, 'cap': 2},
+                {'id': 'DP2', 'type': 'edge', 'edge': ('N4', 'N5'),  'demand': 5, 'cap': 1},
+                {'id': 'DP3', 'type': 'edge', 'edge': ('N6', 'N7'),  'demand': 4, 'cap': 1},
             ],
+            'outage_zones': ['S1', 'N3', 'N8', 'N9', 'N10', 'N11', 'N12', 'N13', 'V1', 'N5', 'N7'],
         },
 
-        'Case2': {
-            'repair_crews': {
-                'RC1': {'position': 'N9',  'speed': 2, 'efficiency': 2, 'resources': 10},
-                'RC2': {'position': 'N10', 'speed': 5, 'efficiency': 4, 'resources': 9},
-            },
-            'mobile_power': {
-                'MPS1': {'position': 'N10', 'speed': 3, 'p_limit': 600, 'energy': 4000},
-                'MPS2': {'position': 'N4',  'speed': 7, 'p_limit': 450, 'energy': 3000},
-            },
-            'faults': [
-                {'id': 'DP1', 'type': 'edge', 'edge': ('N3', 'S1'),  'demand': 3,  'cap': 1},
-                {'id': 'DP2', 'type': 'edge', 'edge': ('N2', 'S1'),  'demand': 5,  'cap': 1},
-                {'id': 'DP3', 'type': 'edge', 'edge': ('N1', 'N2'),  'demand': 3,  'cap': 1},
-                {'id': 'DP4', 'type': 'edge', 'edge': ('N13', 'V1'), 'demand': 3,  'cap': 1},
-            ],
-        },
-
+        # ── Case 3 ─────────────────────────────────────────────
+        # Story: Physical bus damage at N10 + line cut isolating N3 section
+        # + a branch fault. Two independent dark zones.
+        # Powered after faults: Grid N1 N2 N4 N5 S1 V2 V3
         'Case3': {
             'repair_crews': {
-                'RC1': {'position': 'N7',  'speed': 5, 'efficiency': 3, 'resources': 12},
+                'RC1': {'position': 'N9',  'speed': 5, 'efficiency': 3, 'resources': 12},
                 'RC2': {'position': 'N11', 'speed': 4, 'efficiency': 4, 'resources': 11},
             },
             'mobile_power': {
                 'MPS1': {'position': 'N11', 'speed': 6, 'p_limit': 600, 'energy': 3500},
-                'MPS2': {'position': 'N10', 'speed': 7, 'p_limit': 600, 'energy': 3500},
+                'MPS2': {'position': 'N4',  'speed': 7, 'p_limit': 600, 'energy': 3500},
             },
             'faults': [
-                {'id': 'DP1', 'type': 'node', 'node': 'N12', 'demand': 4, 'cap': 1},
-                {'id': 'DP2', 'type': 'edge', 'edge': ('N2', 'S1'),  'demand': 4, 'cap': 1},
-                {'id': 'DP3', 'type': 'edge', 'edge': ('N13', 'V1'), 'demand': 3, 'cap': 1},
+                {'id': 'DP1', 'type': 'node', 'node': 'N10', 'demand': 8, 'cap': 1},
+                {'id': 'DP2', 'type': 'edge', 'edge': ('S1', 'N3'),  'demand': 5, 'cap': 1},
+                {'id': 'DP3', 'type': 'edge', 'edge': ('N2', 'N6'),  'demand': 4, 'cap': 1},
             ],
+            'outage_zones': ['N6', 'N7', 'N3', 'N8', 'N9', 'N10', 'N11', 'N12', 'N13', 'V1'],
         },
 
+        # ── Case 4 ─────────────────────────────────────────────
+        # Story: Two node faults (physical equipment damage) + one line fault.
+        # Agents find each fault type independently across the dark zone.
+        # Powered after faults: Grid N1 N2 N4 N5 N6 N7 S1 V2
         'Case4': {
             'repair_crews': {
-                'RC1': {'position': 'N9', 'speed': 2, 'efficiency': 4, 'resources': 10},
-                'RC2': {'position': 'N8', 'speed': 6, 'efficiency': 2, 'resources': 11},
+                'RC1': {'position': 'N9',  'speed': 2, 'efficiency': 4, 'resources': 10},
+                'RC2': {'position': 'N8',  'speed': 6, 'efficiency': 2, 'resources': 11},
             },
             'mobile_power': {
                 'MPS1': {'position': 'N13', 'speed': 4, 'p_limit': 600, 'energy': 4000},
@@ -194,10 +221,15 @@ class IEEE13Cases:
             'faults': [
                 {'id': 'DP1', 'type': 'node', 'node': 'V3', 'demand': 4, 'cap': 1},
                 {'id': 'DP2', 'type': 'node', 'node': 'N9', 'demand': 3, 'cap': 1},
-                {'id': 'DP3', 'type': 'edge', 'edge': ('N3', 'S1'), 'demand': 7, 'cap': 1},
+                {'id': 'DP3', 'type': 'edge', 'edge': ('S1', 'N3'), 'demand': 7, 'cap': 1},
             ],
+            'outage_zones': ['N3', 'N8', 'N9', 'N10', 'N11', 'N12', 'N13', 'V1', 'V3'],
         },
 
+        # ── Case 5 ─────────────────────────────────────────────
+        # Story: Main entrance line N1-N2 is broken — almost the entire grid goes
+        # dark. Two additional faults inside the dark zone make repairs harder.
+        # Powered after faults: Grid N1 V2 V3 (only the small back-loop section)
         'Case5': {
             'repair_crews': {
                 'RC1': {'position': 'N8', 'speed': 3, 'efficiency': 4, 'resources': 13},
@@ -208,10 +240,11 @@ class IEEE13Cases:
                 'MPS2': {'position': 'N10', 'speed': 8, 'p_limit': 450, 'energy': 4000},
             },
             'faults': [
-                {'id': 'DP1', 'type': 'edge', 'edge': ('N2', 'S1'),  'demand': 5, 'cap': 1},
-                {'id': 'DP2', 'type': 'edge', 'edge': ('N3', 'N8'),  'demand': 4, 'cap': 1},
-                {'id': 'DP3', 'type': 'edge', 'edge': ('N1', 'N2'),  'demand': 8, 'cap': 2},
+                {'id': 'DP1', 'type': 'edge', 'edge': ('N1',  'N2'), 'demand': 10, 'cap': 2},
+                {'id': 'DP2', 'type': 'edge', 'edge': ('N3',  'N8'), 'demand': 4,  'cap': 1},
+                {'id': 'DP3', 'type': 'node', 'node': 'N13',         'demand': 6,  'cap': 1},
             ],
+            'outage_zones': ['N2', 'N4', 'N5', 'N6', 'N7', 'S1', 'N3', 'N8', 'N9', 'N10', 'N11', 'N12', 'N13', 'V1'],
         },
     }
 
