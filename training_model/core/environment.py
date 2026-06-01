@@ -11,6 +11,7 @@ from typing import Dict, List, Set
 from .graphs import TGraph, EGraph
 from .agents import RepairCrew, Scout, MPS, DamagePoint, Load
 from ..config.ieee13_cases import IEEE13Network, IEEE13Cases
+from ..config.ieee13new_cases import IEEE13NewNetwork, IEEE13NewCases
 
 
 class DSREnvironment:
@@ -25,6 +26,7 @@ class DSREnvironment:
         self.loads:  Dict[str, Load]        = {}
         self.time    = 0
         self.case_name = None
+        self.network = IEEE13Network  # default; overridden by setup()
 
         # Nodes physically arrived at by any agent (truly visited)
         self.global_visited: Set[str] = set()
@@ -40,7 +42,8 @@ class DSREnvironment:
     # Setup
     # ─────────────────────────────────────────
 
-    def setup(self, case_name: str, num_scouts: int = 1, known_faults: bool = False):
+    def setup(self, case_name: str, num_scouts: int = 1, known_faults: bool = False,
+              network_cls=None, cases_cls=None):
         self.time = 0
         self.case_name = case_name
         self.rcs    = {}
@@ -55,11 +58,10 @@ class DSREnvironment:
         self.outage_zones    = set()
         self.rc_searching    = set()
 
-        net  = IEEE13Network
-        case = IEEE13Cases.get(case_name)
-
-        # Load operator-observable outage zones (defined in test case config)
-        self.outage_zones = set(case.get('outage_zones', []))
+        self.network = network_cls if network_cls is not None else IEEE13Network
+        _cases_cls   = cases_cls   if cases_cls   is not None else IEEE13Cases
+        net  = self.network
+        case = _cases_cls.get(case_name)
 
         # Build TGraph
         for _, frm, to, km in net.ROADS:
@@ -101,8 +103,8 @@ class DSREnvironment:
                       mdata['p_limit'], mdata['energy'])
             self.mps[mps_id] = mps
 
-        # Scouts — start at different positions from RCs to maximize coverage
-        rc_positions = list({r.position for r in self.rcs.values()})
+        # Scouts — start at RC positions in insertion order (deterministic)
+        rc_positions = list(dict.fromkeys(r.position for r in self.rcs.values()))
         for i in range(num_scouts):
             sid = f'Scout{i+1}'
             pos = rc_positions[i % len(rc_positions)]
@@ -110,6 +112,15 @@ class DSREnvironment:
             self.scouts[sid] = scout
             self.global_visited.add(pos)
             self.globally_claimed.add(pos)
+
+        # ── Section protection: open switches for sections with faults,
+        #    then auto-compute outage zones from EGraph BFS ──────────────
+        affected_sections: Set[str] = set()
+        for dp in self.faults.values():
+            affected_sections.update(self._fault_in_sections(dp))
+        for sec_name in affected_sections:
+            self._open_section_switches(sec_name)
+        self._recompute_outage_zones()
 
         self._update_loads()
 
@@ -170,6 +181,9 @@ class DSREnvironment:
                 self.global_visited.add(rc.position)
                 self.globally_claimed.add(rc.position)
                 events.extend(self._check_discovery(rc.position, rc.id, 'RC'))
+                # Edge traversal: discover edge faults on the segment just crossed
+                if rc.position != prev_pos:
+                    events.extend(self._check_edge_traversal(prev_pos, rc.position, rc.id, 'RC'))
             # If RC became idle, clear search flag
             if rc.state == 'idle':
                 self.rc_searching.discard(rc.id)
@@ -178,15 +192,23 @@ class DSREnvironment:
             for dp_id, dp in self.faults.items():
                 if before[dp_id] == 'active' and dp.state == 'repaired':
                     self._restore_fault(dp)
+                    # Clear on_edge for any RC that was stopped on this edge
+                    if dp.type == 'edge':
+                        for r in self.rcs.values():
+                            if r.on_edge and set(r.on_edge) == set(dp.edge or []):
+                                r.on_edge = None
 
         # ── 2. Move Scouts ───────────────────────────────────
         for scout in self.scouts.values():
+            prev_scout_pos = scout.position
             arrived_at = scout.step(current_time=self.time)
             if arrived_at:
                 self.global_visited.add(arrived_at)
                 self.globally_claimed.add(arrived_at)
                 events.append(f'Scout {scout.id} arrived at {arrived_at}')
                 events.extend(self._check_discovery(arrived_at, scout.id, 'Scout'))
+                # Edge traversal: discover edge faults on the segment just crossed
+                events.extend(self._check_edge_traversal(prev_scout_pos, arrived_at, scout.id, 'Scout'))
                 # Immediately assign next unvisited node
                 self._send_to_next_unvisited(scout.id, 'scout')
 
@@ -195,17 +217,29 @@ class DSREnvironment:
             arrived_at = mps.step(current_time=self.time)
             if arrived_at:
                 events.append(f'{mps.id} arrived at {arrived_at}')
-                mps.connect()
-                events.append(f'{mps.id} connected at {arrived_at} — restoring power')
+                sec = self._get_section_for_node(arrived_at)
+                if sec is None or self._section_safe_for_mps(sec):
+                    mps.connect()
+                    events.append(f'{mps.id} connected at {arrived_at} — restoring power')
+                else:
+                    events.append(f'{mps.id} standing by at {arrived_at} — awaiting section clearance')
             # Auto-disconnect if grid now powers this node (fault repaired)
             if mps.state == 'connected':
                 grid_powered = self.egraph.get_powered_nodes()
                 if mps.position in grid_powered:
                     mps.disconnect()
                     events.append(f'{mps.id} disconnected at {mps.position} (grid restored)')
-            # Auto-assign idle MPS to best unpowered node
+            # If standing by: connect as soon as section is confirmed clear
             if mps.state == 'idle' and mps.energy > 0:
-                self._assign_mps(mps, events)
+                sec = self._get_section_for_node(mps.position)
+                other_sources = [m.position for m in self.mps.values()
+                                 if m.state == 'connected' and m.id != mps.id]
+                grid_powered = self.egraph.get_powered_nodes(mps_sources=other_sources)
+                if mps.position not in grid_powered and (sec is None or self._section_safe_for_mps(sec)):
+                    mps.connect()
+                    events.append(f'{mps.id} connected at {mps.position} — section cleared')
+                else:
+                    self._assign_mps(mps, events)
 
         # ── 2b. Redirect ALL moving RCs to any newly discovered / uncovered faults ──
         for rc in self.rcs.values():
@@ -223,17 +257,31 @@ class DSREnvironment:
         for rc in self.rcs.values():
             if rc.state == 'idle' and rc.repair_target is None and rc.resources > 0:
                 repaired = False
+
+                # Edge fault: if at an endpoint but not yet traversed, route to other end
                 for dp in self.faults.values():
-                    if dp.discovered and dp.state == 'active' and self._rc_at_fault(rc, dp):
-                        # Respect cap: count how many RCs are already repairing this fault
-                        currently_repairing = sum(
-                            1 for r in self.rcs.values() if r.repair_target == dp.id
-                        )
-                        if currently_repairing < dp.cap:
-                            rc.start_repair(dp.id)
-                            events.append(f'{rc.id} auto-started repair of {dp.id}')
+                    if (dp.discovered and dp.state == 'active' and dp.type == 'edge'
+                            and dp.edge and rc.position in dp.edge and rc.on_edge is None):
+                        other = dp.edge[1] if rc.position == dp.edge[0] else dp.edge[0]
+                        path, dist = self.tgraph.shortest_path(rc.position, other)
+                        if path:
+                            rc.move_to(path, dist)
+                            events.append(f'{rc.id} traversing fault edge to {other}')
                             repaired = True
-                            break
+                        break
+
+                if not repaired:
+                    for dp in self.faults.values():
+                        if dp.discovered and dp.state == 'active' and self._rc_at_fault(rc, dp):
+                            # Respect cap: count how many RCs are already repairing this fault
+                            currently_repairing = sum(
+                                1 for r in self.rcs.values() if r.repair_target == dp.id
+                            )
+                            if currently_repairing < dp.cap:
+                                rc.start_repair(dp.id)
+                                events.append(f'{rc.id} auto-started repair of {dp.id}')
+                                repaired = True
+                                break
 
                 # ── RC: search if no repair task ─────────────
                 if not repaired and rc.resources > 0:
@@ -267,10 +315,8 @@ class DSREnvironment:
         agents only search there. Powered sections are fine, no need to visit.
         Marks the target as 'claimed' immediately so other agents
         don't go to the same node.
+        Search continues until all faults are repaired (outage zone empty).
         """
-        # No undiscovered faults left — no need to search any more nodes
-        if not any(not dp.discovered for dp in self.faults.values()):
-            return
 
         if agent_type == 'scout':
             agent = self.scouts.get(agent_id)
@@ -282,7 +328,7 @@ class DSREnvironment:
 
         # Search only within the outage zone, only nodes not yet physically visited
         # and not currently claimed as a target by another agent.
-        all_nodes = list(self.tgraph.nodes)
+        all_nodes = sorted(self.tgraph.nodes)  # sorted for deterministic search order
         zone = self.outage_zones if self.outage_zones else set(all_nodes)
         search_pool = [
             n for n in all_nodes
@@ -352,16 +398,26 @@ class DSREnvironment:
             # Count RCs moving toward a fault (only if they have resources)
             if other_rc.target and not other_rc.repair_target and other_rc.state == 'moving' and other_rc.resources > 0:
                 for dp in active_discovered:
-                    fault_loc = dp.node if dp.type == 'node' else (dp.edge[0] if dp.edge else None)
-                    if other_rc.target == fault_loc:
-                        rcs_per_fault[dp.id] = rcs_per_fault.get(dp.id, 0) + 1
+                    if dp.type == 'node':
+                        if other_rc.target == dp.node:
+                            rcs_per_fault[dp.id] = rcs_per_fault.get(dp.id, 0) + 1
+                    elif dp.type == 'edge' and dp.edge:
+                        if other_rc.target in dp.edge:
+                            rcs_per_fault[dp.id] = rcs_per_fault.get(dp.id, 0) + 1
 
         # Find fault that still has capacity and is closest to this RC
         best_dp, best_dist = None, float('inf')
         for dp in active_discovered:
             if rcs_per_fault.get(dp.id, 0) >= dp.cap:
                 continue  # fault already at capacity
-            fault_loc = dp.node if dp.type == 'node' else (dp.edge[0] if dp.edge else None)
+            # For edge faults: route to nearest endpoint (skip if already there)
+            if dp.type == 'node':
+                fault_loc = dp.node
+            elif dp.type == 'edge' and dp.edge:
+                e0, e1 = dp.edge
+                fault_loc = e1 if rc.position == e0 else e0
+            else:
+                fault_loc = None
             if fault_loc:
                 _, d = self.tgraph.shortest_path(rc.position, fault_loc)
                 if 0 < d < best_dist:
@@ -369,7 +425,13 @@ class DSREnvironment:
                     best_dp = dp
 
         if best_dp:
-            fault_loc = best_dp.node if best_dp.type == 'node' else best_dp.edge[0]
+            if best_dp.type == 'node':
+                fault_loc = best_dp.node
+            elif best_dp.type == 'edge' and best_dp.edge:
+                e0, e1 = best_dp.edge
+                fault_loc = e1 if rc.position == e0 else e0
+            else:
+                return None
             # Already heading to this exact location — no need to re-route
             if fault_loc == rc.target:
                 return None
@@ -382,6 +444,33 @@ class DSREnvironment:
     # Discovery
     # ─────────────────────────────────────────
 
+    def _check_edge_traversal(self, from_node: str, to_node: str,
+                              agent_id: str, agent_type: str) -> List[str]:
+        """Discover edge faults when an agent physically traverses the faulted cable segment.
+        Also sets on_edge for already-discovered active faults so RC stops at midpoint."""
+        events = []
+        for dp in self.faults.values():
+            if dp.type != 'edge':
+                continue
+            if dp.edge and {from_node, to_node} == set(dp.edge):
+                agent = self.rcs.get(agent_id) or self.scouts.get(agent_id)
+                if not dp.discovered:
+                    dp.discovered = True
+                    dp.discovered_by = f'{agent_type}:{agent_id}'
+                    dp.discovered_at_step = self.time
+                    if agent:
+                        agent.log_discovery(dp.id, self.time)
+                    events.append(
+                        f'*** {agent_type} {agent_id} DISCOVERED {dp.id} '
+                        f'on edge {from_node}-{to_node} (t={self.time}h) ***'
+                    )
+                # Only RC agents stop at midpoint; Scout keeps moving (no on_edge)
+                if agent_type == 'RC' and dp.state == 'active':
+                    rc_agent = self.rcs.get(agent_id)
+                    if rc_agent:
+                        rc_agent.on_edge = (from_node, to_node)
+        return events
+
     def _check_discovery(self, position: str, agent_id: str, agent_type: str) -> List[str]:
         events = []
         for dp in self.faults.values():
@@ -391,6 +480,7 @@ class DSREnvironment:
             if dp.type == 'node' and dp.node == position:
                 found = True
             elif dp.type == 'edge' and dp.edge and position in dp.edge:
+                # Discovered by arriving at an endpoint node (fallback when traversal didn't happen)
                 found = True
             if found:
                 dp.discovered = True
@@ -406,16 +496,164 @@ class DSREnvironment:
                 )
         return events
 
+    # ─────────────────────────────────────────
+    # Section Protection Helpers
+    # ─────────────────────────────────────────
+
+    def _fault_in_sections(self, dp: DamagePoint) -> List[str]:
+        """Return list of section names whose nodes contain this fault."""
+        affected = []
+        for sec_name, sec_data in self.network.SECTIONS.items():
+            sec_nodes = sec_data['nodes']
+            if dp.type == 'node' and dp.node in sec_nodes:
+                affected.append(sec_name)
+            elif dp.type == 'edge' and dp.edge:
+                if dp.edge[0] in sec_nodes or dp.edge[1] in sec_nodes:
+                    affected.append(sec_name)
+        return affected
+
+    def _open_section_switches(self, section_name: str):
+        """Open all switch edges for the given section (protection trip)."""
+        sec = self.network.SECTIONS.get(section_name)
+        if sec:
+            for eid in sec['switch_edges']:
+                self.egraph.set_edge_state(eid, 'open')
+
+    def _close_section_switches(self, section_name: str):
+        """Close all switch edges for the given section (restoration)."""
+        sec = self.network.SECTIONS.get(section_name)
+        if sec:
+            for eid in sec['switch_edges']:
+                self.egraph.set_edge_state(eid, 'closed')
+
+    def _section_has_active_faults(self, section_name: str) -> bool:
+        """True if any active (unrepaired) fault lies within the section."""
+        sec_nodes = self.network.SECTIONS.get(section_name, {}).get('nodes', set())
+        for dp in self.faults.values():
+            if dp.state == 'active':
+                if dp.type == 'node' and dp.node in sec_nodes:
+                    return True
+                if dp.type == 'edge' and dp.edge:
+                    if dp.edge[0] in sec_nodes or dp.edge[1] in sec_nodes:
+                        return True
+        return False
+
+    def _get_section_for_node(self, node: str) -> str:
+        """Return the section name containing this node, or None."""
+        for sec_name, sec_data in self.network.SECTIONS.items():
+            if node in sec_data['nodes']:
+                return sec_name
+        return None
+
+    def _section_safe_for_mps(self, section_name: str) -> bool:
+        """
+        True if MPS is allowed to power this section.
+        Requires no active faults AND confirmed fault-free:
+          - all faults globally discovered (full knowledge, none active here), OR
+          - all nodes in the section have been physically visited by an agent.
+        """
+        if self._section_has_active_faults(section_name):
+            return False
+        if all(dp.discovered for dp in self.faults.values()):
+            return True
+        sec_nodes = self.network.SECTIONS.get(section_name, {}).get('nodes', set())
+        return sec_nodes.issubset(self.global_visited)
+
+    def _recompute_outage_zones(self):
+        """Set outage_zones to all EGraph nodes not reachable from Grid via closed edges."""
+        powered = self.egraph.get_powered_nodes()
+        self.outage_zones = set(self.egraph.nodes.keys()) - powered
+
     def _rc_at_fault(self, rc: RepairCrew, dp: DamagePoint) -> bool:
         if dp.type == 'node':
             return rc.position == dp.node
-        return bool(dp.edge and rc.position in dp.edge)
+        if dp.type == 'edge' and dp.edge:
+            # RC must have traversed the edge (on_edge set) to repair at midpoint
+            return bool(rc.on_edge and set(rc.on_edge) == set(dp.edge))
+        return False
 
     def _restore_fault(self, dp: DamagePoint):
         """Restore EGraph edges after fault repaired → loads turn ON."""
         dp.repaired_at_step = self.time
         self.egraph.restore_fault({'type': dp.type, 'node': dp.node, 'edge': dp.edge})
+        # Close section switch if this section now has no remaining active faults
+        for sec_name in self._fault_in_sections(dp):
+            if not self._section_has_active_faults(sec_name):
+                self._close_section_switches(sec_name)
+                # If section still dark (parent feeder faulted), try tie-switch restoration
+                self._attempt_tie_restoration(sec_name)
+        self._recompute_outage_zones()
         self._update_loads()
+
+    def _electrical_dist_to_grid(self, start: str) -> float:
+        """Dijkstra through CLOSED electrical edges only. Returns km to nearest GRID, -1 if unreachable."""
+        import heapq
+        grid_nodes = {n for n, t in self.egraph.nodes.items() if t == 'GRID'}
+        if start in grid_nodes:
+            return 0.0
+        km_lookup = {}
+        for _eid, _fn, _tn, _km, _st in self.network.EDGES:
+            km_lookup[(_fn, _tn)] = _km
+            km_lookup[(_tn, _fn)] = _km
+        dist = {start: 0.0}
+        pq = [(0.0, start)]
+        while pq:
+            d, n = heapq.heappop(pq)
+            if n in grid_nodes:
+                return d
+            if d > dist.get(n, float('inf')):
+                continue
+            for neighbor, eid in self.egraph.adjacency.get(n, []):
+                edge = self.egraph.edges[eid]
+                if edge['state'] != 'closed':
+                    continue
+                km = km_lookup.get((n, neighbor), 1.0)
+                nd = d + km
+                if nd < dist.get(neighbor, float('inf')):
+                    dist[neighbor] = nd
+                    heapq.heappush(pq, (nd, neighbor))
+        return -1.0
+
+    def _attempt_tie_restoration(self, section_name: str) -> str:
+        """
+        If section is still dark after its own switches re-close, try closing
+        ONE open tie switch (the one whose other endpoint is closest to GRID
+        through currently-live edges). Returns the closed edge_id, or None.
+        Only one tie closed per section — avoids parallel loops.
+        """
+        sec = self.network.SECTIONS.get(section_name)
+        if not sec:
+            return None
+        sec_nodes = sec['nodes']
+        powered = self.egraph.get_powered_nodes()
+        # If any section node already powered (via normal feeder), do nothing
+        if any(n in powered for n in sec_nodes):
+            return None
+        own_switch_edges = set(sec.get('switch_edges', []))
+        # Collect open switch edges that bridge this section to outside
+        candidates = []  # (edge_id, outside_node, dist_to_grid)
+        for eid, edge in self.egraph.edges.items():
+            if edge['state'] != 'open':
+                continue
+            if eid in own_switch_edges:
+                continue
+            fn, tn = edge['from'], edge['to']
+            if fn in sec_nodes and tn not in sec_nodes:
+                outside = tn
+            elif tn in sec_nodes and fn not in sec_nodes:
+                outside = fn
+            else:
+                continue
+            d = self._electrical_dist_to_grid(outside)
+            if d >= 0:
+                candidates.append((eid, outside, d))
+        if not candidates:
+            return None
+        # Pick the candidate with shortest distance to grid (one tie only — no loops)
+        candidates.sort(key=lambda c: c[2])
+        best_eid, best_outside, best_dist = candidates[0]
+        self.egraph.set_edge_state(best_eid, 'closed')
+        return best_eid
 
     # ─────────────────────────────────────────
     # Actions
@@ -480,8 +718,12 @@ class DSREnvironment:
             mps.move_to(path, dist)
             events.append(f'{mps.id} moving to {best_node} (restores {best_score} loads)')
         elif best_node == mps.position:
-            mps.connect()
-            events.append(f'{mps.id} connected at {mps.position} — restoring power')
+            sec = self._get_section_for_node(mps.position)
+            if sec is None or self._section_safe_for_mps(sec):
+                mps.connect()
+                events.append(f'{mps.id} connected at {mps.position} — restoring power')
+            else:
+                events.append(f'{mps.id} standing by at {mps.position} — awaiting section clearance')
 
     # ─────────────────────────────────────────
     # State / Reward

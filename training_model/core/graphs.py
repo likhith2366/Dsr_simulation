@@ -143,10 +143,14 @@ class EGraph:
     def apply_fault(self, fault: dict):
         """Mark edges as faulted based on fault config."""
         if fault['type'] == 'node':
-            # All edges connected to the faulted node become faulted
+            # All edges connected to the faulted node become faulted,
+            # except edges that connect to a SWITCH node (switches are robust).
             node = fault['node']
             for edge_id, edge in self.edges.items():
                 if edge['from'] == node or edge['to'] == node:
+                    other = edge['to'] if edge['from'] == node else edge['from']
+                    if self.nodes.get(other) == 'SWITCH':
+                        continue
                     self.set_edge_state(edge_id, 'faulted')
 
         elif fault['type'] == 'edge':

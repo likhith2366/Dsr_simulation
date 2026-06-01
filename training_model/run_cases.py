@@ -11,16 +11,22 @@ Run:
 
 import os
 import sys
+import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from training_model.core.environment import DSREnvironment
 from training_model.visualizer import draw_network
-from training_model.config.ieee13_cases import IEEE13Cases
+from training_model.config.ieee13_cases import IEEE13Cases, IEEE13Network
+from training_model.config.ieee13new_cases import IEEE13NewCases, IEEE13NewNetwork
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MAX_STEPS = 50
+
+# Set at runtime via --network flag
+_NETWORK_CLS = None
+_CASES_CLS   = None
 
 
 def run_case(case_name: str, known_faults: bool = False):
@@ -30,7 +36,8 @@ def run_case(case_name: str, known_faults: bool = False):
     print(f"{'='*60}")
 
     env = DSREnvironment()
-    env.setup(case_name, num_scouts=1, known_faults=known_faults)
+    env.setup(case_name, num_scouts=1, known_faults=known_faults,
+              network_cls=_NETWORK_CLS, cases_cls=_CASES_CLS)
 
     # Print initial state
     state = env.get_state()
@@ -125,10 +132,24 @@ def run_case(case_name: str, known_faults: bool = False):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--network', choices=['old', 'new'], default='new',
+                        help='Which IEEE-13 network to use (default: new)')
+    args = parser.parse_args()
+
+    if args.network == 'new':
+        _NETWORK_CLS = IEEE13NewNetwork
+        _CASES_CLS   = IEEE13NewCases
+        print("Using NEW IEEE-13 network (8 switches, V1-V4 tie nodes)")
+    else:
+        _NETWORK_CLS = IEEE13Network
+        _CASES_CLS   = IEEE13Cases
+        print("Using ORIGINAL IEEE-13 network")
+
     known_results   = []
     unknown_results = []
 
-    for case in IEEE13Cases.all_cases():
+    for case in _CASES_CLS.all_cases():
         known_results.append(run_case(case, known_faults=True))
         unknown_results.append(run_case(case, known_faults=False))
 

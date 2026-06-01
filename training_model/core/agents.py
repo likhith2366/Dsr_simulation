@@ -32,6 +32,7 @@ class RepairCrew:
         self.distance_covered   = 0.0       # km already covered on current leg
         self.target      = None
         self.repair_target: Optional[str] = None
+        self.on_edge: Optional[tuple] = None  # (from_node, to_node) when stopped on edge fault
 
         # ── Stats ──────────────────────────────────────────
         self.stats = {
@@ -49,6 +50,7 @@ class RepairCrew:
         self.distance_covered   = 0.0
         self.target = path[-1] if path else None
         self.state  = 'moving'
+        self.on_edge = None  # clear edge position when moving to a new target
 
     def step(self, damage_points: dict, current_time: int = 0) -> List[str]:
         """
@@ -135,6 +137,7 @@ class Scout:
         self.path        = []
         self.remaining_distance = 0.0
         self.target      = None
+        self.on_edge: Optional[tuple] = None
         self.visited: Set[str] = {position}
         self.found_faults: List[str] = []
 
@@ -152,6 +155,7 @@ class Scout:
         self.remaining_distance = distance
         self.target = path[-1] if path else None
         self.state  = 'moving'
+        self.on_edge = None  # clear edge position when Scout starts a new journey
 
     def step(self, current_time: int = 0) -> Optional[str]:
         """Move one hour. Returns new position if arrived, else None."""
