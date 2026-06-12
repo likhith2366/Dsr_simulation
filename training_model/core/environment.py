@@ -1,22 +1,33 @@
 """
-DSR Environment
-===============
-- Shared visited_nodes across ALL agents (Scout + RCs)
-- Scout uses optimized coverage: always picks nearest GLOBALLY unvisited node
-- RC searches when idle and no repair task
-- No two agents visit the same node twice
+DSR Environment (Simulator)
+============================
+Pure physics only — no decision logic here.
+
+Computation each step:
+  state(t-1) + action(t) --> state(t)
+
+  1. Move each agent forward by speed × 1h along their assigned path
+  2. Check fault discovery at new positions / traversed edges
+  3. Apply repair progress to active faults
+  4. Restore EGraph edges for newly repaired faults; close section switches
+  5. Recompute powered nodes via EGraph BFS
+  6. Update load on/off states
+
+All strategy (where to move, which fault to repair) lives in policy.py.
+To swap the decision maker: env.policy = YourPolicy()
 """
 
 from typing import Dict, List, Set
 from .graphs import TGraph, EGraph
 from .agents import RepairCrew, Scout, MPS, DamagePoint, Load
+from .policy import GreedyPolicy
 from ..config.ieee13_cases import IEEE13Network, IEEE13Cases
 from ..config.ieee13new_cases import IEEE13NewNetwork, IEEE13NewCases
 
 
 class DSREnvironment:
 
-    def __init__(self):
+    def __init__(self, policy=None):
         self.tgraph  = TGraph()
         self.egraph  = EGraph()
         self.rcs:    Dict[str, RepairCrew]  = {}
@@ -27,6 +38,7 @@ class DSREnvironment:
         self.time    = 0
         self.case_name = None
         self.network = IEEE13Network  # default; overridden by setup()
+        self.policy  = policy if policy is not None else GreedyPolicy()
 
         # Nodes physically arrived at by any agent (truly visited)
         self.global_visited: Set[str] = set()
@@ -124,39 +136,8 @@ class DSREnvironment:
 
         self._update_loads()
 
-        # Kick MPS toward unpowered sections immediately
-        for mps in self.mps.values():
-            self._assign_mps(mps, [])
-
-        if known_faults:
-            # Pre-reveal all faults and immediately assign RCs
-            for dp in self.faults.values():
-                dp.discovered = True
-                dp.discovered_by = 'known'
-                dp.discovered_at_step = 0
-            for rc in self.rcs.values():
-                # If already standing on a fault, start repair immediately
-                started = self._try_auto_repair(rc)
-                if not started:
-                    self._assign_rc_to_discovered_fault(rc)
-        else:
-            # Check if any agent is already standing on a fault at t=0
-            for rc in self.rcs.values():
-                self._check_discovery(rc.position, rc.id, 'RC')
-            for scout in self.scouts.values():
-                self._check_discovery(scout.position, scout.id, 'Scout')
-
-            # Kick scouts and RCs toward outage zone nodes
-            for scout_id in self.scouts:
-                self._send_to_next_unvisited(scout_id, 'scout')
-            for rc_id in self.rcs:
-                rc = self.rcs[rc_id]
-                # If already on a discovered fault, start repair immediately
-                started = self._try_auto_repair(rc)
-                if not started:
-                    assigned = self._assign_rc_to_discovered_fault(rc)
-                    if not assigned:
-                        self._send_to_next_unvisited(rc_id, 'rc')
+        # Hand off initial assignments to the policy
+        self.policy.on_setup(self, known_faults)
 
     # ─────────────────────────────────────────
     # Time Step
@@ -209,90 +190,32 @@ class DSREnvironment:
                 events.extend(self._check_discovery(arrived_at, scout.id, 'Scout'))
                 # Edge traversal: discover edge faults on the segment just crossed
                 events.extend(self._check_edge_traversal(prev_scout_pos, arrived_at, scout.id, 'Scout'))
-                # Immediately assign next unvisited node
-                self._send_to_next_unvisited(scout.id, 'scout')
+                # Policy decides next target for this scout
+                self.policy.on_scout_arrived(self, scout.id, arrived_at)
 
         # ── 2c. Step MPS (move + connect) ───────────────────────
         for mps in self.mps.values():
             arrived_at = mps.step(current_time=self.time)
             if arrived_at:
                 events.append(f'{mps.id} arrived at {arrived_at}')
-                sec = self._get_section_for_node(arrived_at)
-                if sec is None or self._section_safe_for_mps(sec):
-                    mps.connect()
-                    events.append(f'{mps.id} connected at {arrived_at} — restoring power')
-                else:
-                    events.append(f'{mps.id} standing by at {arrived_at} — awaiting section clearance')
-            # Auto-disconnect if grid now powers this node (fault repaired)
+                self.policy.on_mps_arrived(self, mps, arrived_at, events)
+            # Physics: auto-disconnect if grid now powers this node
             if mps.state == 'connected':
                 grid_powered = self.egraph.get_powered_nodes()
                 if mps.position in grid_powered:
                     mps.disconnect()
                     events.append(f'{mps.id} disconnected at {mps.position} (grid restored)')
-            # If standing by: connect as soon as section is confirmed clear
+            # Policy: standing by — connect or reassign
             if mps.state == 'idle' and mps.energy > 0:
-                sec = self._get_section_for_node(mps.position)
-                other_sources = [m.position for m in self.mps.values()
-                                 if m.state == 'connected' and m.id != mps.id]
-                grid_powered = self.egraph.get_powered_nodes(mps_sources=other_sources)
-                if mps.position not in grid_powered and (sec is None or self._section_safe_for_mps(sec)):
-                    mps.connect()
-                    events.append(f'{mps.id} connected at {mps.position} — section cleared')
-                else:
-                    self._assign_mps(mps, events)
+                self.policy.on_mps_idle(self, mps, events)
 
-        # ── 2b. Redirect ALL moving RCs to any newly discovered / uncovered faults ──
-        for rc in self.rcs.values():
-            if rc.state == 'moving':
-                old_target = rc.target  # capture BEFORE redirect changes it
-                assigned = self._assign_rc_to_discovered_fault(rc)
-                if assigned and rc.target != old_target:
-                    # Genuinely redirected to a different location
-                    if old_target and rc.id in self.rc_searching:
-                        self.globally_claimed.discard(old_target)
-                    self.rc_searching.discard(rc.id)
-                    events.append(f'{rc.id} redirected to fault {assigned}')
+        # ── 2b. Policy: redirect moving RCs to newly discovered faults ──
+        self.policy.on_fault_discovered(self, events)
 
-        # ── 3. RC: auto-repair if at discovered fault ────────
+        # ── 3. Policy: assign idle RCs (repair / traverse / search) ─────
         for rc in self.rcs.values():
             if rc.state == 'idle' and rc.repair_target is None and rc.resources > 0:
-                repaired = False
-
-                # Edge fault: if at an endpoint but not yet traversed, route to other end
-                for dp in self.faults.values():
-                    if (dp.discovered and dp.state == 'active' and dp.type == 'edge'
-                            and dp.edge and rc.position in dp.edge and rc.on_edge is None):
-                        other = dp.edge[1] if rc.position == dp.edge[0] else dp.edge[0]
-                        path, dist = self.tgraph.shortest_path(rc.position, other)
-                        if path:
-                            rc.move_to(path, dist)
-                            events.append(f'{rc.id} traversing fault edge to {other}')
-                            repaired = True
-                        break
-
-                if not repaired:
-                    for dp in self.faults.values():
-                        if dp.discovered and dp.state == 'active' and self._rc_at_fault(rc, dp):
-                            # Respect cap: count how many RCs are already repairing this fault
-                            currently_repairing = sum(
-                                1 for r in self.rcs.values() if r.repair_target == dp.id
-                            )
-                            if currently_repairing < dp.cap:
-                                rc.start_repair(dp.id)
-                                events.append(f'{rc.id} auto-started repair of {dp.id}')
-                                repaired = True
-                                break
-
-                # ── RC: search if no repair task ─────────────
-                if not repaired and rc.resources > 0:
-                    # Check if any discovered fault needs an RC to travel to it
-                    assigned = self._assign_rc_to_discovered_fault(rc)
-                    if assigned:
-                        self.rc_searching.discard(rc.id)
-                        events.append(f'{rc.id} moving to discovered fault {assigned}')
-                    else:
-                        # No known faults → search unvisited nodes
-                        self._send_to_next_unvisited(rc.id, 'rc')
+                self.policy.on_rc_idle(self, rc, events)
 
         # ── 4. Update power ──────────────────────────────────
         self._update_loads()
@@ -307,138 +230,9 @@ class DSREnvironment:
     # ─────────────────────────────────────────
     # Coordinated Search (shared visited set)
     # ─────────────────────────────────────────
-
-    def _send_to_next_unvisited(self, agent_id: str, agent_type: str):
-        """
-        Send agent to nearest unvisited node in an unpowered section.
-        The grid operator knows which sections have no electricity —
-        agents only search there. Powered sections are fine, no need to visit.
-        Marks the target as 'claimed' immediately so other agents
-        don't go to the same node.
-        Search continues until all faults are repaired (outage zone empty).
-        """
-
-        if agent_type == 'scout':
-            agent = self.scouts.get(agent_id)
-        else:
-            agent = self.rcs.get(agent_id)
-
-        if not agent or agent.state != 'idle':
-            return
-
-        # Search only within the outage zone, only nodes not yet physically visited
-        # and not currently claimed as a target by another agent.
-        all_nodes = sorted(self.tgraph.nodes)  # sorted for deterministic search order
-        zone = self.outage_zones if self.outage_zones else set(all_nodes)
-        search_pool = [
-            n for n in all_nodes
-            if n in zone
-            and n not in self.global_visited    # not yet physically visited
-            and n not in self.globally_claimed  # not currently targeted
-        ]
-
-        if not search_pool:
-            return  # All outage zone nodes covered or claimed
-
-        # Find nearest node in the search pool
-        best_node, best_dist = None, float('inf')
-        for node in search_pool:
-            _, d = self.tgraph.shortest_path(agent.position, node)
-            if 0 < d < best_dist:
-                best_dist = d
-                best_node = node
-
-        if best_node:
-            # Claim target so no other agent is sent to the same node
-            self.globally_claimed.add(best_node)
-
-            if agent_type == 'scout':
-                self.move_scout(agent_id, best_node)
-            else:
-                self.rc_searching.add(agent_id)
-                self.move_rc(agent_id, best_node)
-
-    def _try_auto_repair(self, rc: RepairCrew) -> bool:
-        """Start repair if RC is already standing on a discovered active fault. Returns True if started."""
-        for dp in self.faults.values():
-            if dp.discovered and dp.state == 'active' and self._rc_at_fault(rc, dp):
-                currently_repairing = sum(
-                    1 for r in self.rcs.values() if r.repair_target == dp.id
-                )
-                if currently_repairing < dp.cap:
-                    rc.start_repair(dp.id)
-                    return True
-        return False
-
-    def _assign_rc_to_discovered_fault(self, rc: RepairCrew) -> str:
-        """
-        If a fault is discovered but no RC is heading to it,
-        send this idle RC toward it.
-        Returns fault_id if assigned, else None.
-        """
-        # Collect faults that need an RC
-        active_discovered = [
-            dp for dp in self.faults.values()
-            if dp.discovered and dp.state == 'active'
-        ]
-
-        # Count how many RCs are already assigned (repairing, travelling, or standing on fault)
-        # Only count RCs that still have resources (exhausted RCs can't contribute)
-        rcs_per_fault: Dict[str, int] = {}
-        for other_rc in self.rcs.values():
-            if other_rc.id == rc.id:
-                continue
-            if other_rc.repair_target:
-                rcs_per_fault[other_rc.repair_target] = rcs_per_fault.get(other_rc.repair_target, 0) + 1
-            # Count RCs physically standing on a fault location (only if they have resources)
-            if other_rc.resources > 0:
-                for dp in active_discovered:
-                    if self._rc_at_fault(other_rc, dp):
-                        rcs_per_fault[dp.id] = rcs_per_fault.get(dp.id, 0) + 1
-            # Count RCs moving toward a fault (only if they have resources)
-            if other_rc.target and not other_rc.repair_target and other_rc.state == 'moving' and other_rc.resources > 0:
-                for dp in active_discovered:
-                    if dp.type == 'node':
-                        if other_rc.target == dp.node:
-                            rcs_per_fault[dp.id] = rcs_per_fault.get(dp.id, 0) + 1
-                    elif dp.type == 'edge' and dp.edge:
-                        if other_rc.target in dp.edge:
-                            rcs_per_fault[dp.id] = rcs_per_fault.get(dp.id, 0) + 1
-
-        # Find fault that still has capacity and is closest to this RC
-        best_dp, best_dist = None, float('inf')
-        for dp in active_discovered:
-            if rcs_per_fault.get(dp.id, 0) >= dp.cap:
-                continue  # fault already at capacity
-            # For edge faults: route to nearest endpoint (skip if already there)
-            if dp.type == 'node':
-                fault_loc = dp.node
-            elif dp.type == 'edge' and dp.edge:
-                e0, e1 = dp.edge
-                fault_loc = e1 if rc.position == e0 else e0
-            else:
-                fault_loc = None
-            if fault_loc:
-                _, d = self.tgraph.shortest_path(rc.position, fault_loc)
-                if 0 < d < best_dist:
-                    best_dist = d
-                    best_dp = dp
-
-        if best_dp:
-            if best_dp.type == 'node':
-                fault_loc = best_dp.node
-            elif best_dp.type == 'edge' and best_dp.edge:
-                e0, e1 = best_dp.edge
-                fault_loc = e1 if rc.position == e0 else e0
-            else:
-                return None
-            # Already heading to this exact location — no need to re-route
-            if fault_loc == rc.target:
-                return None
-            self.move_rc(rc.id, fault_loc)
-            return best_dp.id
-
-        return None
+    # Decisions live in policy.py — these helpers remain here because
+    # they are pure simulator utilities (path planning, movement commands)
+    # that the policy calls back into.
 
     # ─────────────────────────────────────────
     # Discovery
@@ -689,41 +483,6 @@ class DSREnvironment:
         for load in self.loads.values():
             load.state = 'on' if load.node in powered else 'off'
 
-    def _assign_mps(self, mps: MPS, events: list):
-        """Send idle MPS to the unpowered node that would restore the most loads."""
-        # Current powered nodes (without this MPS)
-        other_mps = [m.position for m in self.mps.values()
-                     if m.state == 'connected' and m.id != mps.id]
-        grid_powered = self.egraph.get_powered_nodes(mps_sources=other_mps)
-
-        # Find unpowered nodes in TGraph, score by loads they'd restore
-        best_node, best_score, best_dist = None, 0, float('inf')
-        for node in self.tgraph.nodes:
-            if node in grid_powered:
-                continue
-            score = self.egraph.count_loads_if_source(node)
-            if score == 0:
-                continue
-            _, d = self.tgraph.shortest_path(mps.position, node)
-            if d < 0:
-                continue
-            # Prefer more loads restored; break ties by distance
-            if score > best_score or (score == best_score and d < best_dist):
-                best_score = score
-                best_dist  = d
-                best_node  = node
-
-        if best_node and best_node != mps.position:
-            path, dist = self.tgraph.shortest_path(mps.position, best_node)
-            mps.move_to(path, dist)
-            events.append(f'{mps.id} moving to {best_node} (restores {best_score} loads)')
-        elif best_node == mps.position:
-            sec = self._get_section_for_node(mps.position)
-            if sec is None or self._section_safe_for_mps(sec):
-                mps.connect()
-                events.append(f'{mps.id} connected at {mps.position} — restoring power')
-            else:
-                events.append(f'{mps.id} standing by at {mps.position} — awaiting section clearance')
 
     # ─────────────────────────────────────────
     # State / Reward
