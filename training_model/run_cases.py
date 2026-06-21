@@ -93,7 +93,7 @@ def run_case(case_name: str, known_faults: bool = False):
     for dp in env.faults.values():
         disc_t   = f"t={dp.discovered_at_step}h" if dp.discovered_at_step is not None else "NOT FOUND"
         repair_t = f"t={dp.repaired_at_step}h"   if dp.repaired_at_step   is not None else "NOT REPAIRED"
-        lag      = ((dp.repaired_at_step or 0) - (dp.discovered_at_step or 0)) if dp.discovered_at_step else '-'
+        lag      = ((dp.repaired_at_step or 0) - (dp.discovered_at_step or 0)) if dp.discovered_at_step is not None else '-'
         print(f"    {dp.id:4s}: discovered={disc_t:8s}  repaired={repair_t:8s}  "
               f"repair_lag={lag}h  by={dp.discovered_by or 'none'}")
 
@@ -146,20 +146,36 @@ if __name__ == '__main__':
         _CASES_CLS   = IEEE13Cases
         print("Using ORIGINAL IEEE-13 network")
 
-    known_results   = []
-    unknown_results = []
+    import json, datetime
 
+    unknown_results = []
     for case in _CASES_CLS.all_cases():
-        known_results.append(run_case(case, known_faults=True))
         unknown_results.append(run_case(case, known_faults=False))
 
-    print(f"\n{'='*60}")
-    print("  Comparison: Known vs Unknown Faults")
-    print(f"{'='*60}")
-    print(f"  {'Case':<10} {'Known Steps':>12} {'Unknown Steps':>14} {'Extra Hours':>12}")
-    print(f"  {'-'*52}")
-    for k, u in zip(known_results, unknown_results):
-        extra = u['steps'] - k['steps']
-        print(f"  {k['case']:<10} {k['steps']:>12} {u['steps']:>14} {extra:>+12}")
+    # Save summary JSON
+    summary = {
+        'generated': datetime.datetime.now().isoformat(timespec='seconds'),
+        'network': args.network,
+        'cases': [
+            {
+                'case':   r['case'],
+                'hours':  r['steps'],
+                'reward': r['reward'],
+                'done':   r['done'],
+            }
+            for r in unknown_results
+        ]
+    }
+    summary_path = os.path.join(OUTPUT_DIR, 'summary.json')
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
 
-    print(f"\n  Graph images saved to: {OUTPUT_DIR}/")
+    print(f"\n{'='*60}")
+    print("  Unknown Faults — Summary")
+    print(f"{'='*60}")
+    print(f"  {'Case':<10} {'Hours':>8} {'Reward':>10}")
+    print(f"  {'-'*32}")
+    for r in unknown_results:
+        print(f"  {r['case']:<10} {r['steps']:>8} {r['reward']:>10.0f}")
+    print(f"\n  Summary saved to: {summary_path}")
+    print(f"  Graph images saved to: {OUTPUT_DIR}/")

@@ -1,0 +1,36 @@
+{
+  "generated": "2026-06-20T18:24:41",
+  "network": "new",
+  "cases": [
+    {
+      "case": "Case1",
+      "hours": 7,
+      "reward": 11800,
+      "done": true
+    },
+    {
+      "case": "Case2",
+      "hours": 11,
+      "reward": 11800,
+      "done": true
+    },
+    {
+      "case": "Case3",
+      "hours": 11,
+      "reward": 11800,
+      "done": true
+    },
+    {
+      "case": "Case4",
+      "hours": 15,
+      "reward": 11800,
+      "done": true
+    },
+    {
+      "case": "Case5",
+      "hours": 18,
+      "reward": 11800,
+      "done": true
+    }
+  ]
+}

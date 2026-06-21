@@ -137,7 +137,7 @@ class DSREnvironment:
         self._update_loads()
 
         # Hand off initial assignments to the policy
-        self.policy.on_setup(self, known_faults)
+        self.policy.on_setup(self.get_policy_state(), known_faults)
 
     # ─────────────────────────────────────────
     # Time Step
@@ -191,14 +191,14 @@ class DSREnvironment:
                 # Edge traversal: discover edge faults on the segment just crossed
                 events.extend(self._check_edge_traversal(prev_scout_pos, arrived_at, scout.id, 'Scout'))
                 # Policy decides next target for this scout
-                self.policy.on_scout_arrived(self, scout.id, arrived_at)
+                self.policy.on_scout_arrived(self.get_policy_state(), scout.id, arrived_at)
 
         # ── 2c. Step MPS (move + connect) ───────────────────────
         for mps in self.mps.values():
             arrived_at = mps.step(current_time=self.time)
             if arrived_at:
                 events.append(f'{mps.id} arrived at {arrived_at}')
-                self.policy.on_mps_arrived(self, mps, arrived_at, events)
+                self.policy.on_mps_arrived(self.get_policy_state(), mps, arrived_at, events)
             # Physics: auto-disconnect if grid now powers this node
             if mps.state == 'connected':
                 grid_powered = self.egraph.get_powered_nodes()
@@ -207,15 +207,15 @@ class DSREnvironment:
                     events.append(f'{mps.id} disconnected at {mps.position} (grid restored)')
             # Policy: standing by — connect or reassign
             if mps.state == 'idle' and mps.energy > 0:
-                self.policy.on_mps_idle(self, mps, events)
+                self.policy.on_mps_idle(self.get_policy_state(), mps, events)
 
         # ── 2b. Policy: redirect moving RCs to newly discovered faults ──
-        self.policy.on_fault_discovered(self, events)
+        self.policy.on_fault_discovered(self.get_policy_state(), events)
 
         # ── 3. Policy: assign idle RCs (repair / traverse / search) ─────
         for rc in self.rcs.values():
             if rc.state == 'idle' and rc.repair_target is None and rc.resources > 0:
-                self.policy.on_rc_idle(self, rc, events)
+                self.policy.on_rc_idle(self.get_policy_state(), rc, events)
 
         # ── 4. Update power ──────────────────────────────────
         self._update_loads()
@@ -453,6 +453,50 @@ class DSREnvironment:
     # Actions
     # ─────────────────────────────────────────
 
+    def open_switch(self, switch_id: str) -> dict:
+        """Open a switch — sets all edges adjacent to this switch node to 'open'."""
+        if self.egraph.nodes.get(switch_id) != 'SWITCH':
+            return {'status': 'error', 'msg': f'{switch_id} is not a switch'}
+        for eid, edge in self.egraph.edges.items():
+            if edge['from'] == switch_id or edge['to'] == switch_id:
+                self.egraph.set_edge_state(eid, 'open')
+        self._recompute_outage_zones()
+        self._update_loads()
+        return {'status': 'ok', 'switch': switch_id, 'state': 'open'}
+
+    def close_switch(self, switch_id: str) -> dict:
+        """Close a switch — sets all edges adjacent to this switch node to 'closed'."""
+        if self.egraph.nodes.get(switch_id) != 'SWITCH':
+            return {'status': 'error', 'msg': f'{switch_id} is not a switch'}
+        for eid, edge in self.egraph.edges.items():
+            if edge['from'] == switch_id or edge['to'] == switch_id:
+                self.egraph.set_edge_state(eid, 'closed')
+        self._recompute_outage_zones()
+        self._update_loads()
+        return {'status': 'ok', 'switch': switch_id, 'state': 'closed'}
+
+    def get_switch_states(self) -> dict:
+        """Return {switch_id: 'open'|'closed'} — the only switch info policy should see."""
+        result = {}
+        for sw_id, sw_type in self.egraph.nodes.items():
+            if sw_type != 'SWITCH':
+                continue
+            # A switch is 'closed' if ALL its adjacent edges are closed, else 'open'
+            adj_edges = [e for e in self.egraph.edges.values()
+                         if e['from'] == sw_id or e['to'] == sw_id]
+            if adj_edges and all(e['state'] == 'closed' for e in adj_edges):
+                result[sw_id] = 'closed'
+            else:
+                result[sw_id] = 'open'
+        return result
+
+    def get_policy_state(self) -> 'PolicyState':
+        """
+        Filtered state for the policy — hides undiscovered faults,
+        shows switches as open/closed only, includes loads with P/Q.
+        """
+        return PolicyState(self)
+
     def move_rc(self, rc_id: str, target: str) -> dict:
         rc = self.rcs.get(rc_id)
         if not rc:
@@ -514,3 +558,63 @@ class DSREnvironment:
         s['faults_all']   = {k: v.get_state() for k, v in self.faults.items()}
         s['egraph_edges'] = {k: v['state'] for k, v in self.egraph.edges.items()}
         return s
+
+
+class PolicyState:
+    """
+    Filtered view of DSREnvironment passed to policy callbacks.
+
+    Rules:
+      - Undiscovered faults are hidden (policy only sees dark nodes/loads)
+      - Switches exposed as open/closed only — no power state
+      - Loads include P and Q demand
+      - Full env available via .env for action calls (move_rc, open_switch etc.)
+    """
+
+    def __init__(self, env: 'DSREnvironment'):
+        self.env = env  # for action calls: state.env.move_rc(...)
+        self.time = env.time
+
+        # Agents — positions, states, and exact in-transit positions
+        switch_nodes = {n for n, t in env.egraph.nodes.items() if t == 'SWITCH'}
+        self.rcs    = {rid: {**rc.get_state(),    'exact': rc.exact_position(env.tgraph, switch_nodes)}    for rid, rc in env.rcs.items()}
+        self.scouts = {sid: {**sc.get_state(),    'exact': sc.exact_position(env.tgraph, switch_nodes)}    for sid, sc in env.scouts.items()}
+        self.mps    = {mid: {**mp.get_state(),    'exact': mp.exact_position(env.tgraph, switch_nodes)}    for mid, mp in env.mps.items()}
+
+        # Only discovered faults visible
+        self.discovered_faults = {
+            fid: dp.get_state()
+            for fid, dp in env.faults.items()
+            if dp.discovered
+        }
+        dark = env.outage_zones - switch_nodes
+        load_nodes = {l.node for l in env.loads.values()}
+
+        self.dark_nodes       = dark                        # all unpowered (legacy, keep for compat)
+        self.load_nodes       = load_nodes                  # every node with a load attached
+        self.dark_load_nodes  = dark & load_nodes           # unpowered AND has demand
+        self.dark_topo_nodes  = dark - load_nodes           # unpowered, no load (pure topology)
+
+        # Loads with P, Q demand
+        self.loads = {
+            lid: {
+                'node':  l.node,
+                'state': l.state,
+                'P':     l.P,
+                'Q':     l.Q,
+                'W':     l.W,
+            }
+            for lid, l in env.loads.items()
+        }
+
+        # Switches — open/closed only
+        self.switches = env.get_switch_states()
+
+        # Search helpers (needed by greedy policy)
+        self.global_visited   = env.global_visited
+        self.globally_claimed = env.globally_claimed
+        self.outage_zones     = self.dark_load_nodes | self.dark_topo_nodes  # full dark set for search
+        self.rc_searching     = env.rc_searching
+        self.tgraph           = env.tgraph
+        self.egraph           = env.egraph
+        self.network          = env.network

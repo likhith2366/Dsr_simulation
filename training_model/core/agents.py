@@ -108,6 +108,30 @@ class RepairCrew:
     def log_discovery(self, fault_id: str, step: int):
         self.stats['discovery_log'].append((step, fault_id, self.position))
 
+    def exact_position(self, tgraph, switch_nodes=None) -> dict:
+        """Return exact position while moving: which edge, km along it."""
+        if self.state != 'moving' or not self.path or len(self.path) < 2:
+            return {'at': self.position, 'segment': None, 'km_done': 0.0, 'km_left': 0.0}
+        sw = switch_nodes or set()
+        covered = self.distance_covered
+        for i in range(len(self.path) - 1):
+            a, b = self.path[i], self.path[i + 1]
+            seg_len = next(
+                (d for nb, d, _ in tgraph.adjacency.get(a, []) if nb == b), 0.0
+            )
+            if covered <= seg_len + 1e-9:
+                prev = next((self.path[j] for j in range(i, -1, -1) if self.path[j] not in sw), a)
+                nxt  = next((self.path[j] for j in range(i + 1, len(self.path)) if self.path[j] not in sw), b)
+                label = f'{prev}->{nxt}' if prev != nxt else f'{prev}->{b}'
+                return {
+                    'at':      label,
+                    'segment': (a, b),
+                    'km_done': round(covered, 2),
+                    'km_left': round(self.remaining_distance, 2),
+                }
+            covered -= seg_len
+        return {'at': self.position, 'segment': None, 'km_done': 0.0, 'km_left': 0.0}
+
     def get_state(self) -> dict:
         return {
             'id':                 self.id,
@@ -116,6 +140,7 @@ class RepairCrew:
             'resources':          round(self.resources, 2),
             'remaining_distance': round(self.remaining_distance, 2),
             'repair_target':      self.repair_target,
+            'target':             self.target,
             'stats':              {
                 'total_km':        round(self.stats['total_km'], 1),
                 'hours_moving':    self.stats['hours_moving'],
@@ -181,6 +206,31 @@ class Scout:
     def log_discovery(self, fault_id: str, step: int):
         self.found_faults.append(fault_id)
         self.stats['discovery_log'].append((step, fault_id, self.position))
+
+    def exact_position(self, tgraph, switch_nodes=None) -> dict:
+        if self.state != 'moving' or not self.path or len(self.path) < 2:
+            return {'at': self.position, 'segment': None, 'km_done': 0.0, 'km_left': 0.0}
+        sw = switch_nodes or set()
+        total_seg = sum(
+            next((d for nb, d, _ in tgraph.adjacency.get(self.path[i], []) if nb == self.path[i+1]), 0.0)
+            for i in range(len(self.path) - 1)
+        )
+        covered = total_seg - self.remaining_distance
+        for i in range(len(self.path) - 1):
+            a, b = self.path[i], self.path[i + 1]
+            seg_len = next((d for nb, d, _ in tgraph.adjacency.get(a, []) if nb == b), 0.0)
+            if covered <= seg_len + 1e-9:
+                prev = next((self.path[j] for j in range(i, -1, -1) if self.path[j] not in sw), a)
+                nxt  = next((self.path[j] for j in range(i + 1, len(self.path)) if self.path[j] not in sw), b)
+                label = f'{prev}->{nxt}' if prev != nxt else f'{prev}->{b}'
+                return {
+                    'at':      label,
+                    'segment': (a, b),
+                    'km_done': round(covered, 2),
+                    'km_left': round(self.remaining_distance, 2),
+                }
+            covered -= seg_len
+        return {'at': self.position, 'segment': None, 'km_done': 0.0, 'km_left': 0.0}
 
     def get_state(self) -> dict:
         return {
@@ -260,6 +310,31 @@ class MPS:
 
         return None
 
+    def exact_position(self, tgraph, switch_nodes=None) -> dict:
+        if self.state != 'moving' or not self.path or len(self.path) < 2:
+            return {'at': self.position, 'segment': None, 'km_done': 0.0, 'km_left': 0.0}
+        sw = switch_nodes or set()
+        total_seg = sum(
+            next((d for nb, d, _ in tgraph.adjacency.get(self.path[i], []) if nb == self.path[i+1]), 0.0)
+            for i in range(len(self.path) - 1)
+        )
+        covered = total_seg - self.remaining_distance
+        for i in range(len(self.path) - 1):
+            a, b = self.path[i], self.path[i + 1]
+            seg_len = next((d for nb, d, _ in tgraph.adjacency.get(a, []) if nb == b), 0.0)
+            if covered <= seg_len + 1e-9:
+                prev = next((self.path[j] for j in range(i, -1, -1) if self.path[j] not in sw), a)
+                nxt  = next((self.path[j] for j in range(i + 1, len(self.path)) if self.path[j] not in sw), b)
+                label = f'{prev}->{nxt}' if prev != nxt else f'{prev}->{b}'
+                return {
+                    'at':      label,
+                    'segment': (a, b),
+                    'km_done': round(covered, 2),
+                    'km_left': round(self.remaining_distance, 2),
+                }
+            covered -= seg_len
+        return {'at': self.position, 'segment': None, 'km_done': 0.0, 'km_left': 0.0}
+
     def connect(self):
         if self.state == 'idle' and self.energy > 0:
             self.state = 'connected'
@@ -273,6 +348,7 @@ class MPS:
             'id':       self.id,
             'position': self.position,
             'state':    self.state,
+            'target':   self.target,
             'energy':   round(self.energy, 1),
             'p_limit':  self.p_limit,
             'stats':    {
