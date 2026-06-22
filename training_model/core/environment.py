@@ -21,7 +21,7 @@ from typing import Dict, List, Set
 from .graphs import TGraph, EGraph
 from .agents import RepairCrew, Scout, MPS, DamagePoint, Load
 from .policy import GreedyPolicy
-from ..config.ieee13_cases import IEEE13Network, IEEE13Cases
+from ..config.ieee13new_cases import IEEE13NewNetwork as IEEE13Network, IEEE13NewCases as IEEE13Cases
 from ..config.ieee13new_cases import IEEE13NewNetwork, IEEE13NewCases
 
 
@@ -612,9 +612,29 @@ class PolicyState:
 
         # Search helpers (needed by greedy policy)
         self.global_visited   = env.global_visited
+
         self.globally_claimed = env.globally_claimed
         self.outage_zones     = self.dark_load_nodes | self.dark_topo_nodes  # full dark set for search
         self.rc_searching     = env.rc_searching
         self.tgraph           = env.tgraph
         self.egraph           = env.egraph
         self.network          = env.network
+
+        if getattr(env, '_raw_mode', False):
+            import json as _j
+            print(f'\n[SIMULATOR -> POLICY]  t={self.time}')
+            print(_j.dumps({
+                'time': self.time,
+                'rcs': self.rcs,
+                'scouts': self.scouts,
+                'mps': self.mps,
+                'discovered_faults': self.discovered_faults,
+                'load_nodes': sorted(self.load_nodes),
+                'dark_load_nodes': sorted(self.dark_load_nodes),
+                'dark_topo_nodes': sorted(self.dark_topo_nodes),
+                'loads': self.loads,
+                'switches': self.switches,
+                'global_visited': sorted(self.global_visited),
+                'globally_claimed': sorted(self.globally_claimed),
+                'rc_searching': sorted(self.rc_searching),
+            }, indent=2, default=str))

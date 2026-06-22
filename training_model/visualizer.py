@@ -20,7 +20,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import networkx as nx
-from .config.ieee13_cases import IEEE13Network
+from .config.ieee13new_cases import IEEE13NewNetwork
 
 
 # Module-level edge km for old network (kept for any direct callers)
@@ -109,7 +109,7 @@ def _draw_path(ax, path, node_pos, color, style='--', lw=2.0):
 
 
 def draw_network(env, title: str = '', save_path: str = None, show: bool = True):
-    net = getattr(env, 'network', IEEE13Network)
+    net = getattr(env, 'network', IEEE13NewNetwork)
     pos = net.NODE_POS
     _EDGE_KM        = _build_edge_km(net)
     _ROAD_SHORTCUTS = _build_road_shortcuts(net)

@@ -1,1 +1,1 @@
-from .ieee13_cases import IEEE13Network, IEEE13Cases
+from .ieee13new_cases import IEEE13NewNetwork, IEEE13NewCases

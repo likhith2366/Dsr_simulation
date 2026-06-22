@@ -16,7 +16,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from training_model.core.environment import DSREnvironment
 from training_model.visualizer import draw_network
-from training_model.config.ieee13_cases import IEEE13Cases, IEEE13Network
 from training_model.config.ieee13new_cases import IEEE13NewCases, IEEE13NewNetwork
 
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), 'output')
@@ -29,13 +28,14 @@ _NETWORK_CLS = None
 _CASES_CLS   = None
 
 
-def run_case(case_name: str, known_faults: bool = False):
+def run_case(case_name: str, known_faults: bool = False, raw: bool = False):
     mode = 'KNOWN faults' if known_faults else 'UNKNOWN faults'
     print(f"\n{'='*60}")
     print(f"  Case: {case_name}  [{mode}]")
     print(f"{'='*60}")
 
     env = DSREnvironment()
+    env._raw_mode = raw
     env.setup(case_name, num_scouts=1, known_faults=known_faults,
               network_cls=_NETWORK_CLS, cases_cls=_CASES_CLS)
 
@@ -135,22 +135,33 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--network', choices=['old', 'new'], default='new',
                         help='Which IEEE-13 network to use (default: new)')
+    parser.add_argument('--raw', action='store_true',
+                        help='Print raw JSON PolicyState instead of human-readable log')
     args = parser.parse_args()
+
+    if args.raw:
+        import json as _json
+        import training_model.core.policy as _pol
+        _pol._print_state = lambda *a, **kw: None   # suppress human-readable state
+        def _raw_actions(actions):
+            print('[POLICY -> SIMULATOR]')
+            print(_json.dumps({'actions': actions}, indent=2))
+        _pol._print_actions = _raw_actions
 
     if args.network == 'new':
         _NETWORK_CLS = IEEE13NewNetwork
         _CASES_CLS   = IEEE13NewCases
         print("Using NEW IEEE-13 network (8 switches, V1-V4 tie nodes)")
     else:
-        _NETWORK_CLS = IEEE13Network
-        _CASES_CLS   = IEEE13Cases
-        print("Using ORIGINAL IEEE-13 network")
+        _NETWORK_CLS = IEEE13NewNetwork
+        _CASES_CLS   = IEEE13NewCases
+        print("Using NEW IEEE-13 network (old flag ignored, only new network supported)")
 
     import json, datetime
 
     unknown_results = []
     for case in _CASES_CLS.all_cases():
-        unknown_results.append(run_case(case, known_faults=False))
+        unknown_results.append(run_case(case, known_faults=False, raw=args.raw))
 
     # Save summary JSON
     summary = {
