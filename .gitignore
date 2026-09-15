@@ -9,3 +9,10 @@ build/
 .env
 .venv
 __MACOSX/
+
+# DSR agent run artifacts (regenerated every run)
+reference_simulator/agents/*.log
+reference_simulator/agents/blackboard.json
+reference_simulator/agents/blackboard.lock
+reference_simulator/agents/blackboard.tmp
+reference_simulator/runtime/
