@@ -1,0 +1,23 @@
+{
+  "event_id": 0,
+  "default_inspected": true,
+  "unknown_regions": [
+    {
+      "name": "EastCorridor",
+      "lower_left": [8, -12],
+      "upper_right": [14, -4]
+    },
+    {
+      "name": "CentralBlock",
+      "lower_left": [-8, -10],
+      "upper_right": [0, -2]
+    },
+    {
+      "name": "SouthEnd",
+      "lower_left": [-4, -18],
+      "upper_right": [4, -14]
+    }
+  ],
+  "open_switches_in_unknown_regions": false,
+  "open_switches_adjacent_to_unknown_areas": false
+}

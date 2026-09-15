@@ -1,0 +1,7 @@
+{
+  "event_id": 0,
+  "default_inspected": true,
+  "unknown_regions": [],
+  "open_switches_in_unknown_regions": false,
+  "open_switches_adjacent_to_unknown_areas": false
+}

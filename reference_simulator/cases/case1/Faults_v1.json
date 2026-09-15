@@ -1,0 +1,24 @@
+{
+  "Faults": [
+    {
+      "name": "A",
+      "position": [12, -8],
+      "repair_resource": 10
+    },
+    {
+      "name": "B",
+      "position": [-4, -4],
+      "repair_resource": 8
+    },
+    {
+      "name": "C",
+      "position": [0, -16],
+      "repair_resource": 8
+    },
+    {
+      "name": "D",
+      "position": [-4, -8],
+      "repair_resource": 40
+    }
+  ]
+}
